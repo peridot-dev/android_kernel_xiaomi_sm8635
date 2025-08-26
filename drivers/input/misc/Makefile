@@ -93,3 +93,4 @@ obj-$(CONFIG_INPUT_YEALINK)		+= yealink.o
 obj-$(CONFIG_INPUT_IDEAPAD_SLIDEBAR)	+= ideapad_slidebar.o
 obj-$(CONFIG_INPUT_AW86927_HAPTIC)      += aw86927_haptic/
 obj-$(CONFIG_SIH_VIBRATOR)              += si_haptic/
+KBUILD_CPPFLAGS += -DRICHTAP_FOR_PMIC_ENABLE
