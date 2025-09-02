@@ -463,6 +463,8 @@ endmenu
 
 source "drivers/thermal/tegra/Kconfig"
 
+source "drivers/thermal/xiaomi/Kconfig"
+
 config GENERIC_ADC_THERMAL
 	tristate "Generic ADC based thermal sensor"
 	depends on IIO
