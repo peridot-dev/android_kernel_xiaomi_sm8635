@@ -19,10 +19,10 @@
 #include <linux/kernfs.h>
 #include <linux/workqueue.h>
 #include <linux/power_supply.h>
-#include "../../../../../kernel-6.1/drivers/base/base.h"
+#include "../../base/base.h"
 #include "../../power/supply/mtk_charger.h"
 
-#include "../../../../../kernel-6.1/drivers/thermal/thermal_core.h"
+#include "../thermal_core.h"
 
 #if IS_ENABLED(CONFIG_MI_DISP_NOTIFIER)
 #include "../../../drivers/gpu/drm/mediatek/mediatek_v2/mi_disp/mi_disp_notifier.h"
