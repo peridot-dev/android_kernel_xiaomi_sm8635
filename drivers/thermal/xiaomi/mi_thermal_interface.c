@@ -20,7 +20,6 @@
 #include <linux/workqueue.h>
 #include <linux/power_supply.h>
 #include "../../base/base.h"
-#include "../../power/supply/mtk_charger.h"
 
 #include "../thermal_core.h"
 
@@ -484,17 +483,7 @@ static ssize_t thermal_board_sensor_temp_store(struct device *dev,
 					       struct device_attribute *attr,
 					       const char *buf, size_t len)
 {
-	int ret = 0;
-	int val = -1;
-
 	snprintf(board_sensor_temp, BOARD__BUFFER_SIZE, buf);
-	val = simple_strtol(buf, NULL, 10);
-	ret = charger_notifier_call_cnain(THERMAL_BOARD_TEMP, val / 100);
-	if (ret) {
-		pr_err("%s: charger_notifier_call_cnain error:%d\n", __func__,
-		       ret);
-	}
-
 	return len;
 }
 
