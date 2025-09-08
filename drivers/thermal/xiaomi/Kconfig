@@ -21,3 +21,9 @@ config MI_THERMAL_ATC_ENABLE
 	help
 	  Enable atc enable function in kernel, add two sysfs nodes in
 	  thermal_message.
+
+config HAVE_MULTI_SCREEN
+	bool "Have multi screen"
+	default n
+	help
+		Enable register two screen in driver

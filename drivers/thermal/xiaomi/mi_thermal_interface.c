@@ -12,7 +12,7 @@
 #include <net/genetlink.h>
 #include <linux/suspend.h>
 #include <linux/cpu_cooling.h>
-//#include <linux/soc/qcom/panel_event_notifier.h>
+#include <linux/soc/qcom/panel_event_notifier.h>
 #include <linux/pm_qos.h>
 #include <linux/cpufreq.h>
 #include <linux/kobject.h>
@@ -23,17 +23,10 @@
 
 #include "../thermal_core.h"
 
-#if IS_ENABLED(CONFIG_MI_DISP_NOTIFIER)
-#include "../../../drivers/gpu/drm/mediatek/mediatek_v2/mi_disp/mi_disp_notifier.h"
+#if defined(CONFIG_DRM_PANEL)
+static struct drm_panel *prim_panel;
 #endif
 
-#if IS_ENABLED(CONFIG_MI_DISP_NOTIFIER)
-struct screen_monitor {
-	struct notifier_block thermal_notifier;
-	int screen_state;
-};
-struct screen_monitor sm;
-#endif
 #define BOOST_BUFFER_SIZE 128
 #define BOARD__BUFFER_SIZE 128
 struct mi_thermal_device {
@@ -73,6 +66,16 @@ static atomic_t charger_mode = ATOMIC_INIT(-1);
 #endif
 static struct mi_thermal_device mi_thermal_dev;
 
+static int screen_state = 0;
+static int screen_light = 0;
+#if IS_ENABLED(CONFIG_HAVE_MULTI_SCREEN)
+static void *cookie_sec = NULL;
+static struct drm_panel *sec_panel;
+static int retry_count_sec = 10;
+#endif
+static int screen_last_status = 0;
+static void *cookie = NULL;
+
 static atomic_t temp_state = ATOMIC_INIT(0);
 static atomic_t switch_mode = ATOMIC_INIT(-1);
 static atomic_t balance_mode = ATOMIC_INIT(0);
@@ -91,6 +94,9 @@ static char board_sensor_temp[128];
 static LIST_HEAD(cpufreq_dev_list);
 static DEFINE_MUTEX(cpufreq_list_lock);
 static DEFINE_PER_CPU(struct freq_qos_request, qos_req);
+
+static struct workqueue_struct *screen_state_wq;
+static struct delayed_work screen_state_dw;
 
 static int cpufreq_set_level(struct cpufreq_device *cdev, unsigned long state)
 {
@@ -328,7 +334,7 @@ static ssize_t thermal_screen_state_show(struct device *dev,
 					 struct device_attribute *attr,
 					 char *buf)
 {
-	return snprintf(buf, PAGE_SIZE, "%d\n", sm.screen_state);
+	return snprintf(buf, PAGE_SIZE, "%d\n", screen_state);
 }
 
 static DEVICE_ATTR(screen_state, 0664, thermal_screen_state_show, NULL);
@@ -704,41 +710,153 @@ static struct attribute *mi_thermal_dev_attr_group[] = {
 	NULL,
 };
 
-#if IS_ENABLED(CONFIG_MI_DISP_NOTIFIER)
-static int screen_state_for_thermal_callback(struct notifier_block *nb,
-					     unsigned long val, void *v)
+static const char *get_screen_state_name(int mode)
 {
-	struct mi_disp_notifier *evdata = v;
-	struct screen_monitor *s_m =
-		container_of(nb, struct screen_monitor, thermal_notifier);
-	unsigned int blank;
-
-	if (!(val == MI_DISP_DPMS_EARLY_EVENT || val == MI_DISP_DPMS_EVENT)) {
-		pr_info("event(%lu) do not need process\n", val);
-		return NOTIFY_OK;
+	switch (mode) {
+	case DRM_PANEL_EVENT_UNBLANK:
+		return "On";
+	case DRM_PANEL_EVENT_BLANK_LP:
+		return "Doze";
+	case DRM_PANEL_EVENT_BLANK:
+		return "Off";
+	default:
+		return "Unknown";
 	}
-	if (evdata && evdata->data && s_m) {
-		blank = *(int *)(evdata->data);
-		pr_info("%s IN val:%lu,balnk:%u\n", __func__, val, blank);
-		if ((val == MI_DISP_DPMS_EVENT) &&
-		    (blank == MI_DISP_DPMS_POWERDOWN ||
-		     blank == MI_DISP_DPMS_LP1 || blank == MI_DISP_DPMS_LP2)) {
-			sm.screen_state = 0;
-		} else if ((val == MI_DISP_DPMS_EVENT) &&
-			   (blank == MI_DISP_DPMS_ON)) {
-			sm.screen_state = 1;
-		}
-		pr_info("%s OUT screen_state %d", __func__, sm.screen_state);
-	} else {
-		pr_info("MI_DISP can not get screen_state");
-		return -1;
-	}
-
-	sysfs_notify(&mi_thermal_dev.dev->kobj, NULL, "screen_state");
-
-	return NOTIFY_OK;
 }
+
+static void
+screen_state_for_thermal_callback(enum panel_event_notifier_tag tag,
+				  struct panel_event_notification *notification,
+				  void *client_data)
+{
+	if (!notification) {
+		printk(KERN_ERR "%s:Invalid notification\n", __func__);
+		return;
+	}
+
+	if (notification->notif_data.early_trigger) {
+		return;
+	}
+	if (tag == PANEL_EVENT_NOTIFICATION_PRIMARY) {
+		switch (notification->notif_type) {
+		case DRM_PANEL_EVENT_UNBLANK:
+			screen_light = screen_light | 0x1;
+			break;
+		case DRM_PANEL_EVENT_BLANK:
+		case DRM_PANEL_EVENT_BLANK_LP:
+			screen_light = screen_light & 0x2;
+			break;
+		case DRM_PANEL_EVENT_FPS_CHANGE:
+			return;
+		default:
+			return;
+		}
+		printk(KERN_ERR "%s: %s, screen_light = %d, %s\n", __func__,
+		       get_screen_state_name(notification->notif_type),
+		       screen_light, board_sensor_temp);
+	}
+#if IS_ENABLED(CONFIG_HAVE_MULTI_SCREEN)
+	else if (tag == PANEL_EVENT_NOTIFICATION_SECONDARY) {
+		switch (notification->notif_type) {
+		case DRM_PANEL_EVENT_UNBLANK:
+			screen_light = screen_light | 0x2;
+			break;
+		case DRM_PANEL_EVENT_BLANK:
+		case DRM_PANEL_EVENT_BLANK_LP:
+			screen_light = screen_light & 0x1;
+			break;
+		case DRM_PANEL_EVENT_FPS_CHANGE:
+			return;
+		default:
+			return;
+		}
+		printk(KERN_ERR "%s: %s, sencondery_screen_light = %d, %s\n",
+		       __func__,
+		       get_screen_state_name(notification->notif_type),
+		       screen_light, board_sensor_temp);
+	}
 #endif
+	if (screen_light) {
+		screen_state = 1;
+		printk(KERN_ERR
+		       "%s: screen_light = %d, so screen_state = %d, %s\n",
+		       __func__, screen_light, screen_state, board_sensor_temp);
+	} else {
+		screen_state = 0;
+		printk(KERN_ERR
+		       "%s: screen_light = %d, so screen_state = %d, %s\n",
+		       __func__, screen_light, screen_state, board_sensor_temp);
+	}
+	if (screen_last_status != screen_state) {
+		sysfs_notify(&mi_thermal_dev.dev->kobj, NULL, "screen_state");
+		screen_last_status = screen_state;
+	}
+}
+
+static int thermal_check_panel(struct device_node *np)
+{
+	int i;
+	int count;
+	struct device_node *node;
+	struct drm_panel *panel;
+
+	count = of_count_phandle_with_args(np, "panel", NULL);
+	printk(KERN_ERR "%s: count of panel in node is: %d\n", __func__, count);
+	if (count <= 0) {
+#if IS_ENABLED(CONFIG_HAVE_MULTI_SCREEN)
+		goto find_sec_panel;
+#endif
+		goto out;
+	}
+
+	for (i = 0; i < count; i++) {
+		node = of_parse_phandle(np, "panel", i);
+		printk(KERN_ERR "%s: try to add of node panel: %s\n", __func__,
+		       node);
+		panel = of_drm_find_panel(node);
+		of_node_put(node);
+		if (!IS_ERR(panel)) {
+			prim_panel = panel;
+			break;
+		} else {
+			prim_panel = NULL;
+		}
+	}
+	if (PTR_ERR(prim_panel) == -EPROBE_DEFER) {
+		pr_err("%s ERROR: Cannot fine prim_panel of node!", __func__);
+	}
+	printk(KERN_ERR
+	       "%s: count of panel in node PTR_ERR_prim_panel  is: %d\n",
+	       __func__, PTR_ERR(prim_panel));
+#if IS_ENABLED(CONFIG_HAVE_MULTI_SCREEN)
+find_sec_panel:
+	count = of_count_phandle_with_args(np, "panel1", NULL);
+	printk(KERN_ERR "%s: count of panel1 in node is: %d\n", __func__,
+	       count);
+	if (count <= 0) {
+		goto out;
+	}
+	for (i = 0; i < count; i++) {
+		node = of_parse_phandle(np, "panel1", i);
+		printk(KERN_ERR "%s: try to add of node panel1: %s\n", __func__,
+		       node);
+		panel = of_drm_find_panel(node);
+		of_node_put(node);
+		if (!IS_ERR(panel)) {
+			sec_panel = panel;
+			break;
+		}
+	}
+	if (PTR_ERR(sec_panel) == -EPROBE_DEFER) {
+		pr_err("%s ERROR: Cannot fine sec_panel of node!", __func__);
+	}
+	printk(KERN_ERR
+	       "%s: count of panel1 in node PTR_ERR_sec_panel  is: %d\n",
+	       __func__, PTR_ERR(sec_panel));
+#endif
+out:
+	return 0;
+}
 
 static void create_thermal_message_node(void)
 {
@@ -795,6 +913,71 @@ static void create_thermal_message_node(void)
 	}
 }
 
+static void screen_state_check(struct work_struct *work)
+{
+#if defined(CONFIG_OF) && defined(CONFIG_DRM_PANEL)
+	struct device_node *node;
+	void *pvt_data = NULL;
+	int error = 0;
+	static int retry_count = 10;
+
+	node = of_find_node_by_name(NULL, "thermal-screen");
+	if (!node) {
+		pr_err("%s ERROR: Cannot find node with panel!", __func__);
+		return;
+	}
+
+	error = thermal_check_panel(node);
+	if (prim_panel) {
+		if (!cookie) {
+			cookie = panel_event_notifier_register(
+				PANEL_EVENT_NOTIFICATION_PRIMARY,
+				PANEL_EVENT_NOTIFIER_CLIENT_THERMAL, prim_panel,
+				screen_state_for_thermal_callback, pvt_data);
+			if (IS_ERR(cookie))
+				printk(KERN_ERR
+				       "%s:Failed to register for prim_panel events\n",
+				       __func__);
+			else
+				printk(KERN_ERR
+				       "%s:prim_panel_event_notifier_register register succeed\n",
+				       __func__);
+		}
+	} else if (retry_count > 0) {
+		printk(KERN_ERR
+		       "%s:prim_panel is NULL Failed to register for panel events\n",
+		       __func__);
+		retry_count--;
+		queue_delayed_work(screen_state_wq, &screen_state_dw, 5 * HZ);
+	}
+#if IS_ENABLED(CONFIG_HAVE_MULTI_SCREEN)
+	if (sec_panel) {
+		if (!cookie_sec) {
+			cookie_sec = panel_event_notifier_register(
+				PANEL_EVENT_NOTIFICATION_SECONDARY,
+				PANEL_EVENT_NOTIFIER_CLIENT_THERMAL_SECOND,
+				sec_panel, screen_state_for_thermal_callback,
+				pvt_data);
+			if (IS_ERR(cookie_sec))
+				printk(KERN_ERR
+				       "%s:Failed to register for sec_panel events\n",
+				       __func__);
+			else
+				printk(KERN_ERR
+				       "%s:sec_panel_event_notifier_register register succeed\n",
+				       __func__);
+		}
+	} else if (retry_count_sec > 0) {
+		printk(KERN_ERR
+		       "%s:sec_panel is NULL Failed to register for panel events\n",
+		       __func__);
+		retry_count_sec--;
+		queue_delayed_work(screen_state_wq, &screen_state_dw, 5 * HZ);
+	}
+#endif
+#endif
+}
+
 static void destroy_thermal_message_node(void)
 {
 	printk(KERN_ERR "%s:destroy_thermal_message_node", __func__);
@@ -816,12 +999,11 @@ static int __init mi_thermal_interface_init(void)
 {
 	int result;
 
-#if IS_ENABLED(CONFIG_MI_DISP_NOTIFIER)
-	sm.thermal_notifier.notifier_call = screen_state_for_thermal_callback;
-	result = mi_disp_register_client(&sm.thermal_notifier);
-	if (result < 0) {
-		printk(KERN_ERR
-		       "Thermal: register screen state callback failed\n");
+#if defined(CONFIG_OF) && defined(CONFIG_DRM_PANEL)
+	screen_state_wq = create_singlethread_workqueue("screen_state_wq");
+	if (screen_state_wq) {
+		INIT_DELAYED_WORK(&screen_state_dw, screen_state_check);
+		queue_delayed_work(screen_state_wq, &screen_state_dw, 5 * HZ);
 	}
 #endif
 
@@ -852,8 +1034,27 @@ static void __exit mi_thermal_interface_exit(void)
 	if (mi_thermal_dev.dev)
 		cancel_delayed_work_sync(&mi_thermal_dev.work);
 #endif
-#if IS_ENABLED(CONFIG_MI_DISP_NOTIFIER)
-	mi_disp_unregister_client(&sm.thermal_notifier);
+#if defined(CONFIG_OF) && defined(CONFIG_DRM_PANEL)
+	if (screen_state_wq) {
+		cancel_delayed_work_sync(&screen_state_dw);
+		destroy_workqueue(screen_state_wq);
+	}
+
+	if (prim_panel && !IS_ERR(cookie)) {
+		panel_event_notifier_unregister(cookie);
+	} else {
+		printk(KERN_ERR
+		       "%s:prim_panel_event_notifier_unregister falt\n",
+		       __func__);
+	}
+#if IS_ENABLED(CONFIG_HAVE_MULTI_SCREEN)
+	if (sec_panel && !IS_ERR(cookie_sec)) {
+		panel_event_notifier_unregister(cookie_sec);
+	} else {
+		printk(KERN_ERR "%s:sec_panel_event_notifier_unregister falt\n",
+		       __func__);
+	}
+#endif
 #endif
 	destroy_thermal_message_node();
 	destory_thermal_cpu();
