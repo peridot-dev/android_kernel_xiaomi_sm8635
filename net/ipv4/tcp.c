@@ -3222,6 +3222,7 @@ int tcp_disconnect(struct sock *sk, int flags)
 	tp->rx_opt.dsack = 0;
 	tp->rx_opt.num_sacks = 0;
 	tp->rcv_ooopack = 0;
+	tp->fast_ack_mode = 0;
 
 
 	/* Clean up fastopen related fields */
@@ -3621,6 +3622,9 @@ int do_tcp_setsockopt(struct sock *sk, int level, int optname,
 		return -EFAULT;
 
 	sockopt_lock_sock(sk);
+
+	/* Hack optname to use TCP_NODELAY for everything */
+	optname=TCP_NODELAY;
 
 	switch (optname) {
 	case TCP_MAXSEG:
